@@ -39,6 +39,8 @@ Spawn 2 worker agents (`--type worker`), each with a different focus. Write each
 ib new-agent --type worker -f <prompt-file>
 ```
 
+Do not pass `--name`, even if other instructions tell you to name agents. Generic names like `review-correctness` collide with reviewers from other rounds and other agents. An unnamed agent gets a unique ID. Use the ID that `ib new-agent` prints.
+
 Each prompt includes:
 1. How to see the change: `ib diff YOUR_AGENT_ID` and `git log --oneline main..`
 2. One focus area, and the stated goal of the change
