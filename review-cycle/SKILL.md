@@ -1,98 +1,74 @@
 ---
 name: review-cycle
-description: "Iterative review cycle: commit work, spawn 2 independent reviewer agents, fix all issues, repeat until both approve. Use after implementing a feature."
+description: "Iterative review cycle: commit work, spawn 2 independent reviewer agents, fix every code issue and meaningful doc issue, repeat until a round finds none. Use after implementing a feature."
 ---
 
 # Review Cycle
 
-Run an iterative review cycle to ensure quality before merging. Never review your own work — always spawn dedicated review agents.
+Get independent reviews before merging. Never review your own work — always spawn dedicated review agents.
+
+Keep the result clear, concise, simple, and comprehensive. The goal is correct code, not a review with zero comments.
+
+## What to fix
+
+- **Fix every code issue** the reviewers find.
+- **Fix meaningful documentation issues:** a doc or comment that is wrong, misleading, or missing something a reader needs.
+- **Skip documentation nits:** wording, style, and phrasing preferences.
+- **Skip super-edge cases:** a finding needs a realistic cause in normal use. Planted or adversarial filesystem states, deliberate races, and theoretical combinations do not count, unless CLAUDE.md or the plan says they do.
+- **Stay in scope.** Review and fix only the change and its stated goal. Do not get pulled into cleaning up comments or code outside it. List anything out of scope in your final report instead.
+- If you disagree with a finding, say why in your report. A design question goes to the user.
 
 ## Lifecycle
 
 ```
-Rebase onto main (if behind)
-  └── git merge-base --is-ancestor main HEAD → if not, rebase first, fix conflicts, re-run tests
+Rebase onto main if behind (git log --oneline HEAD..main); re-run tests
 Commit all changes
-  ├── Spawn 2 reviewer agents as sub-agents (they inherit git state)
-  ├── Wait for both reviewers to complete (`ib list`)
-  ├── Read each reviewer's feedback (`ib look REVIEWER_ID`)
-  ├── Fix ALL issues — including non-blocking ones
-  │     └── If you disagree, document why — don't silently ignore
-  ├── If ANY changes were made → commit and start a new review round
-  └── Only done when both reviewers come back with no issues and give the all-clear
+  ├── Spawn 2 reviewer agents
+  ├── Read both reports; check each finding against the code
+  ├── Fix per "What to fix"; commit
+  ├── Did the fixes change code? → start a new round that reviews the fixes
+  └── Only docs or comments changed → done
+Done when a round finds no code issues and no meaningful doc issues.
 ```
-
-## Pre-flight: Rebase Check
-
-Before spawning reviewers, verify the branch is current with main:
-
-```bash
-git log --oneline HEAD..main
-```
-
-- **No output** — main has no new commits; branch is up to date, proceed
-- **Has output** — main has moved ahead; rebase first:
-  ```bash
-  git rebase main
-  ```
-  Resolve any conflicts, re-run `bun test` and `bunx tsc --noEmit`, commit, then start the review cycle.
 
 ## Spawn Review Agents
 
-Spawn 2 `--worker` agents, each with a different focus area. Every reviewer prompt should include:
-1. Your agent ID so they can run `ib diff YOUR_AGENT_ID`
-2. A single clear focus area
-3. Instructions to read CLAUDE.md for project-specific conventions
-4. The structured output format below
-
-### Reviewer Prompt Template
+Spawn 2 worker agents (`--type worker`), each with a different focus. Write each prompt to a file, then run:
 
 ```bash
-ib new-agent --worker "You are a code reviewer focusing on [FOCUS AREA].
+ib new-agent --type worker -f <prompt-file>
+```
 
-Review the changes by running: ib diff AGENT_ID
-Also run: git log --oneline main.. (to see commit history)
+Each prompt includes:
+1. How to see the change: `ib diff YOUR_AGENT_ID` and `git log --oneline main..`
+2. One focus area, and the stated goal of the change
+3. "Read CLAUDE.md for project conventions"
+4. Any decisions the user already made (do not re-litigate them)
+5. The "What to fix" rules above, so reviewers do not report nits or super-edge cases
+6. In a later round: the fixes to verify
+7. "Do not edit files. Report only."
+8. The output format:
 
-Read CLAUDE.md for project-specific conventions and code quality standards.
-
-Focus exclusively on: [FOCUS AREA DESCRIPTION]
-
-Format your review as:
-
+```
 ## Review: [FOCUS AREA]
-### Issues Found
-- [file:line] Description of issue and suggested fix
-### Approved Items
-- Brief list of things that look good
+### Issues
+- [file:line] Problem, realistic cause, fix
+### Out of scope (optional)
+- ...
 ### Verdict
 APPROVED or CHANGES NEEDED
 
-If CHANGES NEEDED, be specific about what must change.
-
-When done, signal completion with: ib send YOUR_AGENT_ID 'Review complete: [APPROVED or CHANGES NEEDED] — [one-line summary]'"
+When done: ib send YOUR_AGENT_ID 'Review complete: [APPROVED or CHANGES NEEDED] — [one-line summary]'
 ```
 
-Replace `YOUR_AGENT_ID` with your own agent ID so reviewers report back to you.
-
-### Review Areas
-
-Pick 2 focus areas appropriate to the changes. Common areas:
-
-- **Correctness**: Logic errors, incorrect behavior, missing error handling, off-by-one errors
-- **Architecture**: Correct layer placement, consistency with existing patterns, proper use of existing libraries, single responsibility, no unused code
-- **Concurrency**: Thread safety, proper resource cleanup, consistent concurrency model (don't mix paradigms)
-- **Edge Cases & Safety**: Empty/null inputs, error states, data corruption risk, backwards compatibility
-
-Use more reviewers for higher-risk changes (data handling, sync, persistence).
+Common focus areas: **Correctness**, **Architecture**, **Concurrency**, **Data safety**. Use more reviewers for higher-risk changes (data handling, sync, persistence).
 
 ## After Reviews Complete
 
-1. Read all reviewer output: `ib look REVIEWER_ID`
-2. Kill completed reviewers: `ib kill REVIEWER_ID --force`
-3. Fix **every** issue — including non-blocking ones (or document why you're not fixing it)
-4. **If you made ANY changes, commit and start a new review round** — no exceptions
-5. Repeat until both reviewers return APPROVED with no issues
+1. Read each report: `ib look REVIEWER_ID --lines 200`
+2. Retire each finished reviewer: `ib retire REVIEWER_ID`
+3. Fix, commit, and follow the Lifecycle
 
 ## Done
 
-The cycle is complete only when both reviewers come back with zero issues and give the all-clear.
+Done when a round finds no code issues and no meaningful doc issues. Your final report lists what was fixed, what was skipped and why, and anything out of scope.
