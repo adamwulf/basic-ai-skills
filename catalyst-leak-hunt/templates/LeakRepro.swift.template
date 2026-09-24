@@ -1,0 +1,394 @@
+//
+//  LeakRepro.swift
+//  <YourApp>
+//
+//  DEBUG-only autonomous repro harness for memory leaks.
+//  See ~/.claude/skills/catalyst-leak-hunt/SKILL.md.
+//
+//  TO ADAPT THIS TEMPLATE:
+//    1. Search for "REPLACE:" — each marker is an app-specific decision.
+//    2. Implement the four `// REPLACE: ...` stub methods with calls into
+//       your app's own scene/document/cache APIs.
+//    3. Add the two activation hooks listed at the bottom of SKILL.md.
+//
+
+#if DEBUG
+
+import Foundation
+import UIKit
+import Darwin
+import Darwin.Mach
+
+// Catalyst sandbox forbids Process and homeDirectoryForCurrentUser, so
+// heap/vmmap must run from an external script that reads sentinel files
+// out of the sandbox Documents dir.
+
+final class LeakRepro {
+
+    static let shared = LeakRepro()
+
+    // REPLACE: pick env-var name + scenario name + output subdir name.
+    private let envVar = "DEBUG_SCENARIO"
+    private let scenarioName = "leak-thing-close"
+    private let sentinelFilename = ".debug-scenario"
+    private let outputSubdir = "leak-repro"
+
+    private let outputDir: URL = {
+        let docs = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Documents", isDirectory: true)
+        return docs.appendingPathComponent("leak-repro", isDirectory: true)
+    }()
+
+    private var sceneConnectedContinuation: ((UIScene) -> Void)?
+    private var w1Scene: UIScene?
+    private var w2Scene: UIScene?
+
+    private var started = false
+    private var startTime: Date?
+
+    // MARK: - Entry points
+
+    /// Activate via env var or, on Catalyst where LaunchServices strips
+    /// env vars, via a sentinel file in the sandbox Documents dir.
+    func startIfRequested() {
+        let env = ProcessInfo.processInfo.environment
+        var shouldStart = env[envVar] == scenarioName
+        if !shouldStart {
+            let docs = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Documents", isDirectory: true)
+            let sentinel = docs.appendingPathComponent(sentinelFilename)
+            if let contents = try? String(contentsOf: sentinel, encoding: .utf8) {
+                if contents.trimmingCharacters(in: .whitespacesAndNewlines) == scenarioName {
+                    shouldStart = true
+                }
+            }
+        }
+        guard shouldStart, !started else { return }
+        started = true
+        startTime = Date()
+
+        do {
+            try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        } catch {
+            NSLog("LeakRepro: cannot create output dir at \(outputDir.path): \(error)")
+            return
+        }
+
+        // PID for the external snapshotter; avoids lsappinfo ambiguity.
+        let pidPath = outputDir.appendingPathComponent("getpid.txt")
+        try? "\(getpid())\n".write(to: pidPath, atomically: true, encoding: .utf8)
+
+        appendLog("LeakRepro starting (scenario=\(scenarioName), pid=\(getpid()))")
+
+        Task.detached { [weak self] in
+            await self?.runScenario()
+        }
+    }
+
+    func sceneDidConnect(_ scene: UIScene) {
+        guard started else { return }
+        if w1Scene == nil {
+            w1Scene = scene
+            appendLog("noted W1 scene: \(scene.session.persistentIdentifier)")
+            return
+        }
+        if w2Scene == nil {
+            w2Scene = scene
+            appendLog("noted W2 scene: \(scene.session.persistentIdentifier)")
+            sceneConnectedContinuation?(scene)
+            sceneConnectedContinuation = nil
+        }
+    }
+
+    // MARK: - Scenario
+
+    // REPLACE: this is the typical "open two, close the first" shape.
+    // Adapt the phases to match the user-visible flow you're hunting.
+    private func runScenario() async {
+        appendLog("phase 0: waiting for startup readiness")
+        let ready = await waitForStartupReadiness(timeoutSeconds: 180)
+        if !ready {
+            writeSentinel(name: "done", contents: "ABORT: startup not ready within timeout\n")
+            return
+        }
+
+        guard let (thing1, thing2) = await pickThings() else {
+            writeSentinel(name: "done", contents: "ABORT: could not find two things\n")
+            return
+        }
+
+        await switchActiveSceneToThing(thing1)
+        appendLog("phase 1: driving content load for ~30s")
+        await driveContentLoad(durationSeconds: 30)
+
+        appendLog("phase 2: wait 60s for steady state")
+        try? await Task.sleep(nanoseconds: 60 * NSEC_PER_SEC)
+
+        await captureCheckpoint(label: "A", note: "thing1-loaded")
+
+        appendLog("phase 3: opening thing2 in new window")
+        await openThingInNewWindow(thing2)
+        await waitForSecondSceneConnection(timeoutSeconds: 30)
+
+        appendLog("phase 4: wait 30s for two-window steady state")
+        try? await Task.sleep(nanoseconds: 30 * NSEC_PER_SEC)
+
+        await captureCheckpoint(label: "B", note: "thing1+thing2-open")
+
+        appendLog("phase 5: destroying thing1 scene")
+        let destroyed = await destroyW1Scene()
+        if !destroyed {
+            writeSentinel(name: "done", contents: "ABORT: thing1 destruction failed\n")
+            return
+        }
+
+        await spinMainLoopAndDrain(iterations: 30)
+        appendLog("phase 6: wait 120s for post-close release window")
+        try? await Task.sleep(nanoseconds: 120 * NSEC_PER_SEC)
+
+        await captureCheckpoint(label: "C", note: "thing1-closed-120s")
+
+        writeSentinel(name: "done", contents: "OK\n")
+    }
+
+    // MARK: - App-specific stubs to IMPLEMENT
+
+    // REPLACE: return true once the app has loaded the things to test
+    // (logged-in state, document list populated, etc).
+    @MainActor
+    private func appStartupReadinessCheck() -> Bool {
+        // e.g. AppDelegate.shared.dataController.thingsLoaded
+        //   && !UIApplication.shared.connectedScenes.compactMap { $0.delegate as? YourSceneDelegate }.isEmpty
+        return false
+    }
+
+    // REPLACE: return (thing1, thing2) where thing1 is "the big one to close"
+    // and thing2 is something to keep open in the second window.
+    // Pick from existing on-disk data — do NOT synthesize.
+    @MainActor
+    private func pickThings() async -> (AnyObject, AnyObject)? {
+        return nil
+    }
+
+    // REPLACE: navigate the active scene to thing1.
+    @MainActor
+    private func switchActiveSceneToThing(_ thing: AnyObject) async {
+        // e.g. anySceneDelegateWithContent()?.openThing(thing)
+    }
+
+    // REPLACE: open thing2 in a NEW window via requestSceneSessionActivation.
+    // Don't return until the request was made (the scene connecting is
+    // handled by sceneDidConnect + the waitForSecondSceneConnection helper).
+    @MainActor
+    private func openThingInNewWindow(_ thing: AnyObject) async {
+        let userActivity = NSUserActivity(activityType: "com.example.open-thing")
+        userActivity.userInfo = ["thingId": String(describing: ObjectIdentifier(thing))]
+        UIApplication.shared.requestSceneSessionActivation(
+            nil, userActivity: userActivity, options: nil,
+            errorHandler: { error in
+                LeakRepro.shared.appendLog("scene activation error: \(error)")
+            }
+        )
+    }
+
+    // REPLACE: drive the UI just enough to instantiate the views you
+    // suspect leak. setContentOffset + layoutIfNeeded on the relevant
+    // scroll view, or similar. The layoutIfNeeded() is critical — without
+    // it, lazy view-creation may never fire and the snapshot will miss
+    // the views you wanted to test.
+    @MainActor
+    private func driveContentLoad(durationSeconds: Int) async {
+        // e.g.:
+        // let endTime = Date().addingTimeInterval(TimeInterval(durationSeconds))
+        // var step = 0
+        // while Date() < endTime {
+        //     if let scrollView = currentScrollView {
+        //         let maxX = max(0, scrollView.contentSize.width - scrollView.bounds.width)
+        //         let phase = CGFloat(step % 8) / 8.0
+        //         scrollView.setContentOffset(CGPoint(x: maxX * phase, y: 0), animated: false)
+        //         scrollView.superview?.layoutIfNeeded()
+        //     }
+        //     step += 1
+        //     try? await Task.sleep(nanoseconds: 500 * NSEC_PER_MSEC)
+        // }
+    }
+
+    // MARK: - Scene management
+
+    /// Wait up to `timeoutSeconds` for the app's readiness check to return true.
+    private func waitForStartupReadiness(timeoutSeconds: Int) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < TimeInterval(timeoutSeconds) {
+            let ready = await MainActor.run { self.appStartupReadinessCheck() }
+            if ready {
+                appendLog("startup ready after \(Int(Date().timeIntervalSince(start)))s")
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 2 * NSEC_PER_SEC)
+        }
+        appendLog("startup readiness gave up after \(timeoutSeconds)s")
+        return false
+    }
+
+    private func waitForSecondSceneConnection(timeoutSeconds: Int) async {
+        let start = Date()
+        while Date().timeIntervalSince(start) < TimeInterval(timeoutSeconds) {
+            if await MainActor.run(body: { w2Scene != nil }) {
+                appendLog("W2 scene connected after \(Int(Date().timeIntervalSince(start)))s")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 500 * NSEC_PER_MSEC)
+        }
+        appendLog("WARN: W2 scene never connected within \(timeoutSeconds)s")
+    }
+
+    @MainActor
+    private func destroyW1Scene() async -> Bool {
+        guard w2Scene != nil else {
+            appendLog("ABORT: w2Scene is nil; refusing to destroy what may be the only window")
+            return false
+        }
+        let target: UIScene?
+        if let cached = w1Scene, cached != w2Scene {
+            target = cached
+        } else {
+            target = UIApplication.shared.connectedScenes.first { $0 != w2Scene }
+        }
+        guard let scene = target else {
+            appendLog("ERROR: could not find W1 scene to destroy")
+            return false
+        }
+        appendLog("destroying W1 scene \(scene.session.persistentIdentifier)")
+        UIApplication.shared.requestSceneSessionDestruction(
+            scene.session, options: nil,
+            errorHandler: { error in
+                LeakRepro.shared.appendLog("scene destruction error: \(error)")
+            }
+        )
+        return true
+    }
+
+    private func spinMainLoopAndDrain(iterations: Int) async {
+        await MainActor.run {
+            for _ in 0..<iterations {
+                autoreleasepool {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+                }
+            }
+        }
+    }
+
+    // MARK: - Snapshots
+
+    private struct VMInfo {
+        let rssBytes: UInt64
+        let physFootprintBytes: UInt64
+    }
+
+    /// REV1 count check: trust phys_footprint only when kernel returned the rev1 struct.
+    private func captureVMInfo() -> VMInfo? {
+        let TASK_VM_INFO_COUNT = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+        guard let offset = MemoryLayout.offset(of: \task_vm_info_data_t.min_address) else {
+            return nil
+        }
+        let TASK_VM_INFO_REV1_COUNT = mach_msg_type_number_t(offset / MemoryLayout<integer_t>.size)
+        var info = task_vm_info_data_t()
+        var count = TASK_VM_INFO_COUNT
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { ptr in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), ptr, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS, count >= TASK_VM_INFO_REV1_COUNT else {
+            return nil
+        }
+        return VMInfo(rssBytes: UInt64(info.resident_size),
+                      physFootprintBytes: UInt64(info.phys_footprint))
+    }
+
+    private func captureCheckpoint(label: String, note: String) async {
+        let vmInfo = captureVMInfo()
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let rss = vmInfo?.rssBytes ?? 0
+        let phys = vmInfo?.physFootprintBytes ?? 0
+        appendLog("CHECKPOINT \(label) (\(note)): rss=\(rss / 1024 / 1024) MiB, phys=\(phys / 1024 / 1024) MiB")
+        appendCSV(timestamp: timestamp, checkpoint: label, rss: rss, phys: phys)
+
+        writeSentinel(name: "checkpoint-\(label).request",
+                      contents: "label=\(label)\npid=\(getpid())\nnote=\(note)\nrequested_at=\(timestamp)\n")
+
+        let doneFile = outputDir.appendingPathComponent("checkpoint-\(label).done")
+        let timeoutSec = 600
+        let startTime = Date()
+        while Date().timeIntervalSince(startTime) < TimeInterval(timeoutSec) {
+            if FileManager.default.fileExists(atPath: doneFile.path) {
+                appendLog("checkpoint \(label) snapshot completed after \(Int(Date().timeIntervalSince(startTime)))s")
+                return
+            }
+            try? await Task.sleep(nanoseconds: 1 * NSEC_PER_SEC)
+        }
+        appendLog("WARN: checkpoint \(label) snapshot timed out after \(timeoutSec)s")
+    }
+
+    // MARK: - Output helpers
+
+    private func appendLog(_ msg: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(msg)\n"
+        if let data = line.data(using: .utf8) {
+            let url = outputDir.appendingPathComponent("scenario.log")
+            if let handle = try? FileHandle(forWritingTo: url) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            } else {
+                try? data.write(to: url)
+            }
+        }
+        NSLog("LeakRepro: \(msg)")
+    }
+
+    private func appendCSV(timestamp: String, checkpoint: String, rss: UInt64, phys: UInt64) {
+        let url = outputDir.appendingPathComponent("timeline.csv")
+        let isNew = !FileManager.default.fileExists(atPath: url.path)
+        var line = ""
+        if isNew { line += "timestamp,checkpoint,rss_bytes,phys_footprint_bytes\n" }
+        line += "\(timestamp),\(checkpoint),\(rss),\(phys)\n"
+        if let data = line.data(using: .utf8) {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    private func writeSentinel(name: String, contents: String) {
+        let url = outputDir.appendingPathComponent(name)
+        try? contents.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+// =====================================================================
+// HOOK POINTS (add these one-line calls to your existing code):
+//
+// 1. In AppDelegate.application(_:didFinishLaunchingWithOptions:),
+//    after fullSetup:
+//
+//        #if DEBUG
+//        LeakRepro.shared.startIfRequested()
+//        #endif
+//
+// 2. In your UIWindowSceneDelegate's scene(_:willConnectTo:options:),
+//    near the end:
+//
+//        #if DEBUG
+//        LeakRepro.shared.sceneDidConnect(scene)
+//        #endif
+//
+// =====================================================================
+
+#endif  // DEBUG
