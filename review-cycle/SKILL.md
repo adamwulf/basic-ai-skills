@@ -74,3 +74,5 @@ Common focus areas: **Correctness**, **Architecture**, **Concurrency**, **Data s
 ## Done
 
 Done when a round finds no code issues and no meaningful doc issues. Your final report lists what was fixed, what was skipped and why, and anything out of scope.
+
+When all reviewers approve, close out the reviewers and notify your manager.
