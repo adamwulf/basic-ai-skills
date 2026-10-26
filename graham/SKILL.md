@@ -42,9 +42,10 @@ expire after 7 days, so `auth login` is needed about weekly. An *Internal* or
   the default, `json` carries the full detail, and `id` prints bare ids for
   scripts.
 - Formatting nouns are `get`/`set` pairs that take the same range options:
-  `docs paragraph get|set`, `docs style get|set`, `slides notes get|set`.
-  `get` prints values in the units `set` takes, so a value read can be
-  written straight back.
+  `docs paragraph get|set`, `docs style get|set`, `slides notes get|set`,
+  `slides slide get|set`. `get` prints values in the units `set` takes, so a
+  value read can be written straight back. One exception: a slide background
+  that reads `image` is written with `--background-image <url>`.
 - Write commands print the id of what they made or changed.
 - Positions are one-based: slide positions, table rows and columns, tab
   positions. Docs and Slides text indices are zero-based UTF-16 code units, as
@@ -81,9 +82,10 @@ string.
   and borders; named ranges, conditional format, validation, filters, and
   protection; charts.
 - **slides** — all text (`cat`); every element with its geometry and ids
-  (`list`); layouts and images; add, move, and delete slides; create, move,
-  style, and group elements; tables; text insert, delete, style, paragraphs,
-  and bullets; speaker notes; alt text; chart refresh.
+  (`list`); layouts and images; add, move, and delete slides; skip (hide) a
+  slide and set its background (`slide get|set`); create, move, style, and
+  group elements; tables; text insert, delete, style, paragraphs, and bullets;
+  speaker notes; alt text; chart refresh.
 
 Each service has a live smoke test (`graham docs test`, and the same for
 `drive`, `sheets`, and `slides`). It creates a file in a "graham test" folder,
